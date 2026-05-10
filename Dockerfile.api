@@ -13,7 +13,7 @@ WORKDIR /app
 RUN useradd -r -u 10001 rinha \
  && install -d -m 0777 /sockets
 COPY --from=build /src/api/target/release/api /usr/local/bin/api
-COPY resources/*.bin ./resources
+COPY resources ./resources
 
 ENV API_ADDR=0.0.0.0:8080
 ENV RESOURCES_DIR=/app/resources
