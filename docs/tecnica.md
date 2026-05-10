@@ -7,8 +7,8 @@ Este documento descreve a arquitetura e o hot path da solução atual. A API tra
 ```mermaid
 flowchart LR
   client["cliente / k6"] -- TCP :9999 --> lb["LB C + epoll<br/>TCP_NODELAY<br/>TCP_QUICKACK<br/>TCP_DEFER_ACCEPT<br/>0.20 CPU / 30 MB"]
-  lb -- UDS /sockets --> api1["api1<br/>Rust + epoll reactor<br/>0.40 CPU / 160 MB"]
-  lb -- UDS /sockets --> api2["api2<br/>Rust + epoll reactor<br/>0.40 CPU / 160 MB"]
+  lb -- UDS /sockets --> api1["api1<br/>Rust + tokio-uring/Tokio<br/>0.40 CPU / 160 MB"]
+  lb -- UDS /sockets --> api2["api2<br/>Rust + tokio-uring/Tokio<br/>0.40 CPU / 160 MB"]
   api1 --> data["resources/*.bin<br/>índice em memória<br/>centroides em SoA"]
   api2 --> data
 ```
@@ -22,7 +22,7 @@ sequenceDiagram
   autonumber
   participant C as Cliente
   participant L as LB C
-  participant A as API Rust (epoll)
+  participant A as API Rust (tokio-uring + Tokio)
   participant P as parser zero-alloc
   participant V as vectorize
   participant I as ivf_index AVX2
@@ -157,18 +157,18 @@ Etapas finais:
 
 ## Reactor da API
 
-Cada API é um processo Rust single-thread com `mio::Poll` registrando dois listeners (TCP em `0.0.0.0:8080` para fallback e UDS em `/sockets/api{1,2}.sock` para o caminho competitivo). As conexões vivem em um `HashMap<Token, Conn>` indexado por token incremental. Cada conexão guarda um buffer de leitura de `8 KB`, a posição de escrita e o interest atual.
+Cada API é um processo Rust single-thread com runtime híbrido: TCP em `0.0.0.0:8080` via `tokio-uring` e UDS em `/sockets/api{1,2}.sock` via Tokio padrão. O fallback no socket Unix é intencional, porque o `UnixListener::bind` do `tokio-uring` 0.5.0 força opções de socket incompatíveis com `AF_UNIX` no kernel Linux. Em ambos os caminhos, cada conexão vira uma task local e reaproveita um buffer de `8 KB`.
 
 Estados:
 
 ```text
-ACCEPT  -> registra READABLE (TCP_NODELAY + TCP_QUICKACK no fd TCP)
-READ    -> drain até WouldBlock; se request HTTP completo, gera resposta
-WRITE   -> tenta send imediato; se EAGAIN, registra WRITABLE
-KEEP    -> após resposta, volta a READ; pipelining suportado pelo loop interno
+ACCEPT  -> aceita no listener e aplica TCP_NODELAY + TCP_QUICKACK no fd TCP
+READ    -> TCP: `stream.read(buf.slice(read_len..))`; UDS: `AsyncReadExt::read`
+WRITE   -> TCP: `stream.write_all(resp)` via io_uring; UDS: `AsyncWriteExt::write_all`
+KEEP    -> compacta bytes remanescentes e volta a READ no mesmo task loop
 ```
 
-Não existe thread por conexão nem alocação por requisição, e a resposta HTTP já fica pré-computada em um `&'static [u8]`.
+Não existe thread por conexão. A resposta HTTP continua pré-computada em um `&'static [u8]`; no TCP o mesmo buffer owned é recuperado após cada leitura do `io_uring`, e no UDS o buffer é reutilizado no loop do Tokio.
 
 ## Load balancer
 
