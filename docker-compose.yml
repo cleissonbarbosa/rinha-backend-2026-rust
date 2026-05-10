@@ -1,14 +1,17 @@
 services:
   api1:
-    image: cleissonb/rinha-backend-2026-cedar-api:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: cleissonb/rinha-backend-2026-rust-api:latest
     platform: linux/amd64
     environment:
       API_ADDR: 0.0.0.0:8080
       API_SOCKET: /sockets/api1.sock
       RESOURCES_DIR: /app/resources
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - sockets:/sockets
     expose:
@@ -20,11 +23,14 @@ services:
     restart: unless-stopped
 
   api2:
-    image: cleissonb/rinha-backend-2026-cedar-api:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: cleissonb/rinha-backend-2026-rust-api:latest
     platform: linux/amd64
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     environment:
       API_ADDR: 0.0.0.0:8080
       API_SOCKET: /sockets/api2.sock
@@ -40,11 +46,14 @@ services:
     restart: unless-stopped
 
   lb:
-    image: cleissonb/rinha-backend-2026-cedar-lb:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.lb
+    image: cleissonb/rinha-backend-2026-rust-lb:latest
     platform: linux/amd64
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    security_opt:
+      - seccomp:unconfined
     environment:
       BACKEND1: unix:/sockets/api1.sock
       BACKEND2: unix:/sockets/api2.sock
