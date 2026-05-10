@@ -2,6 +2,7 @@ services:
   api1:
     image: cleissonb/rinha-backend-2026-rust-api:latest
     platform: linux/amd64
+    pull_policy: always
     environment:
       API_ADDR: 0.0.0.0:8080
       API_SOCKET: /sockets/api1.sock
@@ -25,6 +26,7 @@ services:
   api2:
     image: cleissonb/rinha-backend-2026-rust-api:latest
     platform: linux/amd64
+    pull_policy: always
     ulimits:
       nofile:
         soft: 65535
@@ -48,6 +50,7 @@ services:
   lb:
     image: cleissonb/rinha-backend-2026-rust-lb:latest
     platform: linux/amd64
+    pull_policy: always
     ulimits:
       nofile:
         soft: 65535
