@@ -10,7 +10,7 @@ api:
 lb:
 	$(MAKE) -C lb
 
-docker-build:
+docker/build:
 	docker compose build
 
 up:
@@ -28,3 +28,6 @@ test:
 
 smoke-test:
 	sh ./scripts/official-test.sh smoke
+
+docker/push:
+	docker compose push

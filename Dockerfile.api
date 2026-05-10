@@ -5,7 +5,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 COPY api/Cargo.toml api/Cargo.lock ./api/
 COPY api/src ./api/src
-COPY tools ./tools
 RUN cargo build --manifest-path api/Cargo.toml --release --bin api
 
 FROM debian:bookworm-slim
