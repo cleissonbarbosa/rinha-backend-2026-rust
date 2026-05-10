@@ -1,4 +1,9 @@
-resources/*.bin
-resources/*.gz
-**/target/
-lb/lb
+resources/
+api/
+lb/
+docs/
+tools/
+.cargo/
+Dockerfile.*
+Makefile
+README.md
