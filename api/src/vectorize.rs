@@ -74,7 +74,11 @@ impl Normalization {
 
     fn mcc_risk(&self, tx: &TxInput) -> f64 {
         let key = std::str::from_utf8(&tx.mcc[..tx.mcc_len as usize]).unwrap_or("");
-        self.mcc_risk.get(key).copied().unwrap_or(0.5).clamp(0.0, 1.0)
+        self.mcc_risk
+            .get(key)
+            .copied()
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0)
     }
 }
 

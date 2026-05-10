@@ -1,10 +1,15 @@
 use std::cell::RefCell;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::Path;
+use std::fs::File;
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::slice;
+use std::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+use memmap2::Mmap;
 
 use crate::types::DIM;
 
@@ -18,11 +23,164 @@ const REFINE_STEP: i32 = 128;
 const REFINE_SCALE: f32 = Q16_SCALE * REFINE_STEP as f32;
 const REFINE_MIN: i32 = -32_767 * REFINE_STEP;
 const REFINE_MAX: i32 = 32_767 * REFINE_STEP;
-const COARSE_TIE_GAP: f32 = 512.0;
+const COARSE_TIE_GAP: f32 = 2048.0;
 const SIMD_LANES: usize = 8;
 
 thread_local! {
-    static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    // static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+     static SCRATCH: RefCell<QueryScratch> = const { RefCell::new(QueryScratch::new()) };
+}
+
+struct QueryScratch {
+    centroid_dist: Vec<f32>,
+    probed_epoch: Vec<u32>,
+    range_dist: Vec<f32>,
+    epoch: u32,
+}
+
+impl QueryScratch {
+    const fn new() -> Self {
+        Self {
+            centroid_dist: Vec::new(),
+            probed_epoch: Vec::new(),
+            range_dist: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    fn prepare(&mut self, n_clusters: usize, n_clusters_padded: usize) -> u32 {
+        if self.centroid_dist.len() < n_clusters_padded {
+            self.centroid_dist.resize(n_clusters_padded, 0.0);
+        }
+        if self.probed_epoch.len() < n_clusters {
+            self.probed_epoch.resize(n_clusters, 0);
+        }
+
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.probed_epoch.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+}
+
+#[derive(Clone)]
+enum MappedFileData {
+    Empty,
+    Mmap(Arc<Mmap>),
+}
+
+#[derive(Clone)]
+struct MappedFile {
+    data: MappedFileData,
+    path: PathBuf,
+}
+
+impl MappedFile {
+    fn open(path: &Path) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let len = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len() as usize;
+        let data = if len == 0 {
+            MappedFileData::Empty
+        } else {
+            let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("{}: {e}", path.display()))? };
+            MappedFileData::Mmap(Arc::new(mmap))
+        };
+
+        Ok(Self {
+            data,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        match &self.data {
+            MappedFileData::Empty => 0,
+            MappedFileData::Mmap(mmap) => mmap.len(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.data {
+            MappedFileData::Empty => &[],
+            MappedFileData::Mmap(mmap) => &mmap[..],
+        }
+    }
+
+    fn full_bytes(&self) -> MappedBytes {
+        MappedBytes {
+            file: self.clone(),
+            offset: 0,
+            len: self.len(),
+        }
+    }
+
+    fn typed_slice<T>(&self, offset: usize, count: usize) -> Result<MappedSlice<T>, String> {
+        let byte_len = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| format!("{}: mapped slice too large", self.path.display()))?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| format!("{}: mapped slice too large", self.path.display()))?;
+        if end > self.len() {
+            return Err(format!("{}: truncated mapped slice", self.path.display()));
+        }
+
+        if count > 0 {
+            let ptr = unsafe { self.bytes().as_ptr().add(offset) };
+            let align = std::mem::align_of::<T>();
+            if align > 1 && (ptr as usize) % align != 0 {
+                return Err(format!("{}: unaligned mapped slice", self.path.display()));
+            }
+        }
+
+        Ok(MappedSlice {
+            file: self.clone(),
+            offset,
+            len: count,
+            _marker: PhantomData,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MappedBytes {
+    file: MappedFile,
+    offset: usize,
+    len: usize,
+}
+
+impl Deref for MappedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.file.bytes()[self.offset..self.offset + self.len]
+    }
+}
+
+#[derive(Clone)]
+struct MappedSlice<T> {
+    file: MappedFile,
+    offset: usize,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Deref for MappedSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            slice::from_raw_parts(
+                self.file.bytes().as_ptr().add(self.offset) as *const T,
+                self.len,
+            )
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -30,36 +188,41 @@ pub struct ExactIndex {
     n_vecs: usize,
     n_clusters: usize,
     nprobe: usize,
-    dims: Vec<i16>,
-    residuals: Vec<u8>,
-    labels: Vec<u8>,
-    centroids: Vec<f32>,
+    dims: MappedSlice<i16>,
+    residuals: MappedBytes,
+    labels: MappedBytes,
+    centroids: MappedSlice<f32>,
     centroids_soa: Vec<f32>,
     n_clusters_padded: usize,
-    radii: Vec<f32>,
-    boundaries: Vec<u32>,
+    radii: MappedSlice<f32>,
+    boundaries: MappedSlice<u32>,
 }
 
 impl ExactIndex {
     pub fn load(resources_dir: &Path) -> Result<Self, String> {
-        let labels = fs::read(resources_dir.join("labels.bin")).map_err(|e| format!("labels.bin: {e}"))?;
+        let labels = MappedFile::open(&resources_dir.join("labels.bin"))?.full_bytes();
         let n_vecs = labels.len();
         if n_vecs == 0 {
             return Err("empty labels.bin".to_string());
         }
 
-        let dims = read_i16_file(&resources_dir.join("vectors.bin"))?;
+        let dims = map_i16_file(&resources_dir.join("vectors.bin"))?;
         if dims.len() != DIM * n_vecs {
-            return Err(format!("vectors.bin size mismatch: got {} i16s for {n_vecs} labels", dims.len()));
+            return Err(format!(
+                "vectors.bin size mismatch: got {} i16s for {n_vecs} labels",
+                dims.len()
+            ));
         }
 
-        let residuals = fs::read(resources_dir.join("residuals.bin")).map_err(|e| format!("residuals.bin: {e}"))?;
+        let residuals = MappedFile::open(&resources_dir.join("residuals.bin"))?.full_bytes();
         if residuals.len() != DIM * n_vecs {
-            return Err(format!("residuals.bin size mismatch: got {} bytes for {n_vecs} labels", residuals.len()));
+            return Err(format!(
+                "residuals.bin size mismatch: got {} bytes for {n_vecs} labels",
+                residuals.len()
+            ));
         }
 
-        let ivf = fs::read(resources_dir.join("ivf.bin")).map_err(|e| format!("ivf.bin: {e}"))?;
-        let parsed = ParsedIvf::parse(&ivf, n_vecs)?;
+        let parsed = ParsedIvf::parse(MappedFile::open(&resources_dir.join("ivf.bin"))?, n_vecs)?;
 
         let n_clusters_padded = ((parsed.n_clusters + SIMD_LANES - 1) / SIMD_LANES) * SIMD_LANES;
         let mut centroids_soa = vec![0.0f32; n_clusters_padded * DIM];
@@ -99,35 +262,80 @@ impl ExactIndex {
             query_refined[i] = quant_refined(query[i]);
         }
 
-        let mut probe_dist = [f32::INFINITY; MAX_NPROBE];
-        let mut probe_idx = [0u32; MAX_NPROBE];
-        let mut centroid_dist = vec![0.0f32; self.n_clusters_padded];
-        let mut probed = vec![false; self.n_clusters];
+        // let mut probe_dist = [f32::INFINITY; MAX_NPROBE];
+        // let mut probe_idx = [0u32; MAX_NPROBE];
+        // let mut centroid_dist = vec![0.0f32; self.n_clusters_padded];
+        // let mut probed = vec![false; self.n_clusters];
 
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
-        unsafe {
-            self.scan_centroids_avx2(&query_coarse, &mut centroid_dist);
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
-        {
-            self.scan_centroids_scalar(&query_coarse, &mut centroid_dist);
-        }
+        // #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+        // unsafe {
+        //     self.scan_centroids_avx2(&query_coarse, &mut centroid_dist);
+        // }
+        // #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+        // {
+        //     self.scan_centroids_scalar(&query_coarse, &mut centroid_dist);
+        // }
 
-        for c in 0..self.n_clusters {
-            insert_probe(&mut probe_dist, &mut probe_idx, self.nprobe, c as u32, centroid_dist[c]);
-        }
+        // for c in 0..self.n_clusters {
+        //     insert_probe(&mut probe_dist, &mut probe_idx, self.nprobe, c as u32, centroid_dist[c]);
+        // }
 
         let mut top_dist = [f32::INFINITY; TOP_C];
         let mut top_idx = [0u32; TOP_C];
 
         SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
+            let epoch = scratch.prepare(self.n_clusters, self.n_clusters_padded);
+
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx2",
+                target_feature = "fma"
+            ))]
+            unsafe {
+                self.scan_centroids_avx2(
+                    &query_coarse,
+                    &mut scratch.centroid_dist[..self.n_clusters_padded],
+                );
+            }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx2",
+                target_feature = "fma"
+            )))]
+            {
+                self.scan_centroids_scalar(
+                    &query_coarse,
+                    &mut scratch.centroid_dist[..self.n_clusters_padded],
+                );
+            }
+
+            let mut probe_dist = [f32::INFINITY; MAX_NPROBE];
+            let mut probe_idx = [0u32; MAX_NPROBE];
+            for c in 0..self.n_clusters {
+                insert_probe(
+                    &mut probe_dist,
+                    &mut probe_idx,
+                    self.nprobe,
+                    c as u32,
+                    scratch.centroid_dist[c],
+                );
+            }
             for &cluster in probe_idx[..self.nprobe].iter() {
                 let cluster = cluster as usize;
-                probed[cluster] = true;
+                // probed[cluster] = true;
+                scratch.probed_epoch[cluster] = epoch;
                 let start = self.boundaries[cluster] as usize;
                 let end = self.boundaries[cluster + 1] as usize;
-                self.scan_range(&query_coarse, start, end, &mut top_dist, &mut top_idx, &mut scratch);
+                // self.scan_range(&query_coarse, start, end, &mut top_dist, &mut top_idx, &mut scratch);
+                self.scan_range(
+                    &query_coarse,
+                    start,
+                    end,
+                    &mut top_dist,
+                    &mut top_idx,
+                    &mut scratch.range_dist,
+                );
             }
 
             let seed_fraud_count = count_top_frauds(&self.labels, &top_dist, &top_idx, K);
@@ -137,13 +345,25 @@ impl ExactIndex {
                     expanded = false;
                     let tau = top_dist[TOP_C - 1];
                     for c in 0..self.n_clusters {
-                        if probed[c] || lower_bound_sq(centroid_dist[c], self.radii[c]) >= tau {
+                        // if probed[c] || lower_bound_sq(centroid_dist[c], self.radii[c]) >= tau {
+                        if scratch.probed_epoch[c] == epoch
+                            || lower_bound_sq(scratch.centroid_dist[c], self.radii[c]) >= tau
+                        {
                             continue;
                         }
-                        probed[c] = true;
+                        // probed[c] = true;
+                        scratch.probed_epoch[c] = epoch;
                         let start = self.boundaries[c] as usize;
                         let end = self.boundaries[c + 1] as usize;
-                        self.scan_range(&query_coarse, start, end, &mut top_dist, &mut top_idx, &mut scratch);
+                        // self.scan_range(&query_coarse, start, end, &mut top_dist, &mut top_idx, &mut scratch);
+                        self.scan_range(
+                            &query_coarse,
+                            start,
+                            end,
+                            &mut top_dist,
+                            &mut top_idx,
+                            &mut scratch.range_dist,
+                        );
                         expanded = true;
                     }
                 }
@@ -194,11 +414,19 @@ impl ExactIndex {
 
         // Loop swap: outer over dims (cache-friendly SoA reads), inner over indices.
         // Inner loop is 8-wide AVX2 SIMD when target_feature is enabled.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        ))]
         unsafe {
             self.compute_distances_avx2(query, start, n, scratch);
         }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        )))]
         {
             self.compute_distances_scalar(query, start, n, scratch);
         }
@@ -208,7 +436,11 @@ impl ExactIndex {
         }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn compute_distances_avx2(
         &self,
@@ -277,7 +509,11 @@ impl ExactIndex {
         hi * REFINE_STEP + residual
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn scan_centroids_avx2(&self, query: &[f32; DIM], dist_out: &mut [f32]) {
         let n_padded = self.n_clusters_padded;
@@ -312,7 +548,12 @@ impl ExactIndex {
     }
 }
 
-fn count_top_frauds(labels: &[u8], top_dist: &[f32; TOP_C], top_idx: &[u32; TOP_C], limit: usize) -> usize {
+fn count_top_frauds(
+    labels: &[u8],
+    top_dist: &[f32; TOP_C],
+    top_idx: &[u32; TOP_C],
+    limit: usize,
+) -> usize {
     let mut fraud_count = 0usize;
     for i in 0..limit {
         if top_dist[i].is_infinite() {
@@ -326,13 +567,14 @@ fn count_top_frauds(labels: &[u8], top_dist: &[f32; TOP_C], top_idx: &[u32; TOP_
 struct ParsedIvf {
     n_clusters: usize,
     nprobe: usize,
-    centroids: Vec<f32>,
-    radii: Vec<f32>,
-    boundaries: Vec<u32>,
+    centroids: MappedSlice<f32>,
+    radii: MappedSlice<f32>,
+    boundaries: MappedSlice<u32>,
 }
 
 impl ParsedIvf {
-    fn parse(bytes: &[u8], n_vecs: usize) -> Result<Self, String> {
+    fn parse(file: MappedFile, n_vecs: usize) -> Result<Self, String> {
+        let bytes = file.bytes();
         if bytes.len() < IVF_MAGIC.len() + 20 || &bytes[..IVF_MAGIC.len()] != IVF_MAGIC {
             return Err("bad ivf header".to_string());
         }
@@ -352,10 +594,13 @@ impl ParsedIvf {
         }
 
         let centroid_count = n_clusters * DIM;
-        let centroids = read_f32_vec(bytes, &mut off, centroid_count)?;
-        let radii = read_f32_vec(bytes, &mut off, n_clusters)?;
-        let boundaries = read_u32_vec(bytes, &mut off, n_clusters + 1)?;
-        if off != bytes.len() || boundaries.first() != Some(&0) || boundaries.last() != Some(&(n_vecs as u32)) {
+        let centroids = read_mapped_slice::<f32>(&file, &mut off, centroid_count)?;
+        let radii = read_mapped_slice::<f32>(&file, &mut off, n_clusters)?;
+        let boundaries = read_mapped_slice::<u32>(&file, &mut off, n_clusters + 1)?;
+        if off != file.len()
+            || boundaries.first() != Some(&0)
+            || boundaries.last() != Some(&(n_vecs as u32))
+        {
             return Err("bad ivf payload".to_string());
         }
 
@@ -369,24 +614,14 @@ impl ParsedIvf {
     }
 }
 
-fn read_i16_file(path: &Path) -> Result<Vec<i16>, String> {
-    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .len() as usize;
+fn map_i16_file(path: &Path) -> Result<MappedSlice<i16>, String> {
+    let file = MappedFile::open(path)?;
+    let len = file.len();
     if len % 2 != 0 {
         return Err(format!("{} has odd length", path.display()));
     }
 
-    let mut values = Vec::<i16>::with_capacity(len / 2);
-    unsafe {
-        values.set_len(len / 2);
-        let bytes = std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, len);
-        file.read_exact(bytes)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    Ok(values)
+    file.typed_slice(0, len / 2)
 }
 
 fn read_u32(bytes: &[u8], off: &mut usize) -> Result<u32, String> {
@@ -398,30 +633,19 @@ fn read_u32(bytes: &[u8], off: &mut usize) -> Result<u32, String> {
     Ok(value)
 }
 
-fn read_f32_vec(bytes: &[u8], off: &mut usize, count: usize) -> Result<Vec<f32>, String> {
-    let byte_len = count * 4;
-    if *off + byte_len > bytes.len() {
-        return Err("truncated f32 vec".to_string());
-    }
-    let mut out = Vec::with_capacity(count);
-    for chunk in bytes[*off..*off + byte_len].chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    *off += byte_len;
-    Ok(out)
-}
-
-fn read_u32_vec(bytes: &[u8], off: &mut usize, count: usize) -> Result<Vec<u32>, String> {
-    let byte_len = count * 4;
-    if *off + byte_len > bytes.len() {
-        return Err("truncated u32 vec".to_string());
-    }
-    let mut out = Vec::with_capacity(count);
-    for chunk in bytes[*off..*off + byte_len].chunks_exact(4) {
-        out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    *off += byte_len;
-    Ok(out)
+fn read_mapped_slice<T>(
+    file: &MappedFile,
+    off: &mut usize,
+    count: usize,
+) -> Result<MappedSlice<T>, String> {
+    let byte_len = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| format!("{}: mapped slice too large", file.path.display()))?;
+    let slice = file.typed_slice(*off, count)?;
+    *off = off
+        .checked_add(byte_len)
+        .ok_or_else(|| format!("{}: mapped slice too large", file.path.display()))?;
+    Ok(slice)
 }
 
 fn quant16(x: f32) -> i32 {

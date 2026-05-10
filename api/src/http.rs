@@ -65,7 +65,11 @@ impl App {
         let q = normalized_vector(&tx, &self.norm);
         let vectorize_ns = t.elapsed().as_nanos();
         let t = Instant::now();
-        let score = if tx.parse_ok { self.index.query(&q).min(5) } else { 5 };
+        let score = if tx.parse_ok {
+            self.index.query(&q).min(5)
+        } else {
+            5
+        };
         let ann = t.elapsed().as_nanos();
         (
             score,
@@ -107,7 +111,12 @@ impl Stream {
         }
     }
 
-    fn reregister(&mut self, registry: &Registry, tok: Token, interest: Interest) -> io::Result<()> {
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        tok: Token,
+        interest: Interest,
+    ) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.reregister(registry, tok, interest),
             Stream::Uds(s) => s.reregister(registry, tok, interest),

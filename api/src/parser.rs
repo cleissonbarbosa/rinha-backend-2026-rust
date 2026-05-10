@@ -31,8 +31,16 @@ pub fn parse_transaction(body: &[u8]) -> TxInput {
             }
             match key {
                 b"transaction" => parse_transaction_block(&mut p, &mut tx),
-                b"customer" => parse_customer_block(&mut p, &mut tx, &mut known_ids, &mut known_lens, &mut known_count),
-                b"merchant" => parse_merchant_block(&mut p, &mut tx, &mut merchant_id, &mut merchant_id_len),
+                b"customer" => parse_customer_block(
+                    &mut p,
+                    &mut tx,
+                    &mut known_ids,
+                    &mut known_lens,
+                    &mut known_count,
+                ),
+                b"merchant" => {
+                    parse_merchant_block(&mut p, &mut tx, &mut merchant_id, &mut merchant_id_len)
+                }
                 b"terminal" => parse_terminal_block(&mut p, &mut tx),
                 b"last_transaction" => {
                     parse_last_tx_block(&mut p, &mut tx, &mut last_tx_seconds, &mut last_tx_seen);
@@ -494,7 +502,12 @@ fn parse_terminal_block(p: &mut Parser, tx: &mut TxInput) {
     }
 }
 
-fn parse_last_tx_block(p: &mut Parser, tx: &mut TxInput, last_tx_seconds: &mut i64, last_tx_seen: &mut bool) {
+fn parse_last_tx_block(
+    p: &mut Parser,
+    tx: &mut TxInput,
+    last_tx_seconds: &mut i64,
+    last_tx_seen: &mut bool,
+) {
     p.skip_ws();
     if p.parse_null() {
         return;
