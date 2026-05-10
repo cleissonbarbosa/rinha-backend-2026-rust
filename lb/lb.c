@@ -174,6 +174,8 @@ static Conn *new_conn(int fd, int peer, int backend, int connected) {
     return c;
 }
 
+static void handle_write(int ep, Conn *c);
+
 static void accept_loop(int ep, int lfd) {
     for (;;) {
         struct sockaddr_storage ss;
@@ -223,6 +225,13 @@ static void handle_read(int ep, Conn *c) {
             memcpy(p->buf + p->len, tmp, (size_t)n);
             p->len += (size_t)n;
             mod_epoll(ep, p);
+            if (!p->is_backend || p->connected) {
+                int fd = c->fd;
+                handle_write(ep, p);
+                if (fd < 0 || fd >= MAX_FD || !fdtab[fd]) {
+                    return;
+                }
+            }
             continue;
         }
         if (n == 0) {
