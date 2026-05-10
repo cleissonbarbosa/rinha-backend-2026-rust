@@ -19,7 +19,7 @@ services:
       - "8080"
     networks:
       - rinha
-    cpus: 0.35
+    cpus: 0.30
     mem_limit: 150m
     restart: unless-stopped
 
@@ -43,7 +43,7 @@ services:
       - "8080"
     networks:
       - rinha
-    cpus: 0.35
+    cpus: 0.30
     mem_limit: 150m
     restart: unless-stopped
 
@@ -71,7 +71,7 @@ services:
       - api2
     networks:
       - rinha
-    cpus: 0.30
+    cpus: 0.40
     mem_limit: 50m
     restart: unless-stopped
 
