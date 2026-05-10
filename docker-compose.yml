@@ -1,0 +1,71 @@
+services:
+  api1:
+    image: cleissonb/rinha-backend-2026-cedar-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    platform: linux/amd64
+    environment:
+      API_ADDR: 0.0.0.0:8080
+      API_SOCKET: /sockets/api1.sock
+      RESOURCES_DIR: /app/resources
+    volumes:
+      - sockets:/sockets
+    expose:
+      - "8080"
+    networks:
+      - rinha
+    cpus: 0.40
+    mem_limit: 170m
+    restart: unless-stopped
+
+  api2:
+    image: cleissonb/rinha-backend-2026-cedar-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    platform: linux/amd64
+    environment:
+      API_ADDR: 0.0.0.0:8080
+      API_SOCKET: /sockets/api2.sock
+      RESOURCES_DIR: /app/resources
+    volumes:
+      - sockets:/sockets
+    expose:
+      - "8080"
+    networks:
+      - rinha
+    cpus: 0.40
+    mem_limit: 170m
+    restart: unless-stopped
+
+  lb:
+    image: cleissonb/rinha-backend-2026-cedar-lb:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    platform: linux/amd64
+    environment:
+      BACKEND1: unix:/sockets/api1.sock
+      BACKEND2: unix:/sockets/api2.sock
+      LB_ADDR: 0.0.0.0
+      LB_PORT: "9999"
+    volumes:
+      - sockets:/sockets
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - rinha
+    cpus: 0.20
+    mem_limit: 10m
+    restart: unless-stopped
+
+networks:
+  rinha:
+    driver: bridge
+
+volumes:
+  sockets:

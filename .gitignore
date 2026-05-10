@@ -1,0 +1,4 @@
+resources/*.bin
+resources/*.gz
+**/target/
+lb/lb
