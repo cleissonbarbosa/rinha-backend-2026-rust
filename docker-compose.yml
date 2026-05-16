@@ -1,6 +1,6 @@
 services:
   api1:
-    image: cleissonb/rinha-backend-2026-rust-api:v0.1.4
+    image: cleissonb/rinha-backend-2026-rust-api:v0.1.5
     platform: linux/amd64
     environment:
       API_ADDR: 0.0.0.0:8080
@@ -19,12 +19,12 @@ services:
       - "8080"
     networks:
       - rinha
-    cpus: 0.485
-    mem_limit: 150m
+    cpus: 0.42
+    mem_limit: 165m
     restart: unless-stopped
 
   api2:
-    image: cleissonb/rinha-backend-2026-rust-api:v0.1.4
+    image: cleissonb/rinha-backend-2026-rust-api:v0.1.5
     platform: linux/amd64
     environment:
       API_ADDR: 0.0.0.0:8080
@@ -43,12 +43,12 @@ services:
       - "8080"
     networks:
       - rinha
-    cpus: 0.485
-    mem_limit: 150m
+    cpus: 0.42
+    mem_limit: 165m
     restart: unless-stopped
 
   lb:
-    image: cleissonb/rinha-backend-2026-rust-lb:v0.1.4
+    image: cleissonb/rinha-backend-2026-rust-lb:v0.1.5
     platform: linux/amd64
     environment:
       BACKEND1: unix:/sockets/api1-http.sock
@@ -72,8 +72,8 @@ services:
       - api2
     networks:
       - rinha
-    cpus: 0.03
-    mem_limit: 50m
+    cpus: 0.16
+    mem_limit: 20m
     restart: unless-stopped
 
 networks:
@@ -82,3 +82,8 @@ networks:
 
 volumes:
   sockets:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=10m
